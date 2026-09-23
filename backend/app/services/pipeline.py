@@ -228,7 +228,13 @@ class SearchPipeline:
         }
 
     def _retrieve_and_rerank(self, pq: ProcessedQuery, top_k: int) -> list[dict]:
-        fused = self.hybrid.retrieve(pq)
+        # The candidate pool must be wider than the requested top_k or the
+        # reranker has nothing to reorder. This previously called
+        # hybrid.retrieve(pq) with no top_k at all, so the pool was always the
+        # global default (30) no matter what the caller asked for -- silently
+        # capping recall@k for every k > 30 during evaluation.
+        pool = max(top_k * settings.rerank_pool_factor, settings.retrieval_top_k)
+        fused = self.hybrid.retrieve(pq, top_k=pool)
         if not fused:
             return []
         ids = [pid for pid, _ in fused]

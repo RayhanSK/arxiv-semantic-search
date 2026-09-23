@@ -61,9 +61,20 @@ class Settings(BaseSettings):
     # backend: "sentence-transformers" (production) | "hash" (dependency-free
     # deterministic fallback used for tests / environments without torch)
     embedding_backend: str = "sentence-transformers"
+    # all-MiniLM-L6-v2 is a 2021 general-purpose encoder trained on web/QA
+    # pairs; scientific abstracts are out of distribution for it. Anything in
+    # the BGE / E5 / GTE / SPECTER families is a better fit for this corpus --
+    # measure the swap with `python -m evaluation.harness --model ...` rather
+    # than taking that on faith.
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dim: int = 384             # used by the hash fallback; ST models
     embedding_batch_size: int = 64       # report their own dim at runtime.
+    # Asymmetric encoders expect a role prefix on each side. Left empty the
+    # model still runs and silently gives up a large slice of its advantage,
+    # which reads as "the better model is worse" and gets it reverted.
+    # Empty string = auto-detect from the model name (see embeddings.py).
+    embedding_query_prefix: str = "auto"
+    embedding_doc_prefix: str = "auto"
 
     # ---------------------------------------------------------- retrieval
     retrieval_top_k: int = 30            # candidates from each retriever
@@ -73,6 +84,10 @@ class Settings(BaseSettings):
     rrf_k: int = 60
 
     # --------------------------------------------------------- reranking
+    # Candidate pool handed to the reranker = rerank_top_k * this factor
+    # (floored at retrieval_top_k). Reranking only helps if it is given more
+    # candidates than it is asked to return.
+    rerank_pool_factor: int = 5
     reranker_enabled: bool = True
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_top_k: int = 10               # papers surviving the reranker

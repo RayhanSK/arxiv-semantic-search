@@ -29,16 +29,67 @@ class BaseEmbedder:
     def encode_one(self, text: str) -> np.ndarray:
         return self.encode([text])[0]
 
+    def encode_query(self, text: str) -> np.ndarray:
+        """Query-side encoding. Symmetric by default; overridden where the
+        model expects a distinct query prefix."""
+        return self.encode_one(text)
+
+
+# Asymmetric retrieval encoders are trained with a role prefix on each side:
+# the query and the document go through the same weights but are told which
+# they are. Omitting the prefix does not error -- it just quietly costs a
+# chunk of the model's retrieval quality, which is how a team concludes that
+# a stronger model performed worse and reverts to MiniLM.
+_PREFIX_BY_MODEL: dict[str, tuple[str, str]] = {
+    "intfloat/e5": ("query: ", "passage: "),
+    "intfloat/multilingual-e5": ("query: ", "passage: "),
+    "BAAI/bge": (
+        "Represent this sentence for searching relevant passages: ", ""
+    ),
+    # GTE, SPECTER and the sentence-transformers/* family are symmetric.
+    "thenlper/gte": ("", ""),
+    "allenai/specter": ("", ""),
+    "sentence-transformers/": ("", ""),
+}
+
+
+def auto_prefixes(model_name: str) -> tuple[str, str]:
+    for stem, pair in _PREFIX_BY_MODEL.items():
+        if model_name.lower().startswith(stem.lower()):
+            return pair
+    return ("", "")
+
 
 class SentenceTransformerEmbedder(BaseEmbedder):
+    """Encodes documents and queries with the model's expected role prefixes.
+
+    `encode()` is the document path (it is what the indexers call);
+    `encode_query()` is the query path. They differ only by prefix, but that
+    difference is the whole point of an asymmetric encoder.
+    """
+
     def __init__(self, model_name: str):
         from sentence_transformers import SentenceTransformer  # lazy import
 
         self.model = SentenceTransformer(model_name)
         self.dim = self.model.get_sentence_embedding_dimension()
-        logger.info("Loaded embedding model %s (dim=%d)", model_name, self.dim)
+        auto_q, auto_d = auto_prefixes(model_name)
+        self.q_prefix = (
+            auto_q if settings.embedding_query_prefix == "auto"
+            else settings.embedding_query_prefix
+        )
+        self.d_prefix = (
+            auto_d if settings.embedding_doc_prefix == "auto"
+            else settings.embedding_doc_prefix
+        )
+        logger.info(
+            "Loaded embedding model %s (dim=%d, query_prefix=%r, doc_prefix=%r)",
+            model_name, self.dim, self.q_prefix, self.d_prefix,
+        )
 
-    def encode(self, texts: list[str]) -> np.ndarray:
+    def _encode(self, texts: list[str], prefix: str) -> np.ndarray:
+        if prefix:
+            texts = [prefix + t for t in texts]
         vecs = self.model.encode(
             texts,
             batch_size=settings.embedding_batch_size,
@@ -46,6 +97,14 @@ class SentenceTransformerEmbedder(BaseEmbedder):
             show_progress_bar=False,
         )
         return np.asarray(vecs, dtype="float32")
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        """Document side. Used by every indexing path."""
+        return self._encode(texts, self.d_prefix)
+
+    def encode_query(self, text: str) -> np.ndarray:
+        """Query side. Used by retrieval."""
+        return self._encode([text], self.q_prefix)[0]
 
 
 class HashEmbedder(BaseEmbedder):

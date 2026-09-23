@@ -31,6 +31,9 @@ class DenseRetriever:
     def retrieve(self, query: str, top_k: int = 30) -> list[tuple[str, float]]:
         if self.store.ntotal == 0:
             return []
-        qv = self.embedder.encode_one(query)
+        # encode_query, not encode_one: asymmetric models need the query-side
+        # prefix here. encode_one() would embed the query as if it were a
+        # document and quietly lose retrieval quality.
+        qv = self.embedder.encode_query(query)
         hits = self.store.search(qv, top_k=top_k)
         return [(m["arxiv_id"], score) for _, score, m in hits]

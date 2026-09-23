@@ -4,3 +4,8 @@ __pycache__/
 data/
 *.egg-info/
 .pytest_cache/
+
+# local venv + frozen corpus snapshots (large, regenerate with scripts/harvest.py)
+.venv/
+evaluation/data/*.jsonl
+evaluation/data/*.json

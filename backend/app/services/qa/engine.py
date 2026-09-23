@@ -57,7 +57,8 @@ class QAEngine:
         section: str | None = None,
     ) -> list[dict]:
         top_k = top_k or settings.qa_chunk_top_k
-        qv = self.embedder.encode_one(question)
+        # query side -- see embeddings.SentenceTransformerEmbedder
+        qv = self.embedder.encode_query(question)
         allowed = set(paper_ids) if paper_ids else None
 
         def _filter(meta: dict) -> bool:
