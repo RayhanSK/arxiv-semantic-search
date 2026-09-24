@@ -58,6 +58,10 @@ class ProcessedQuery:
     # traits for dynamic alpha
     technicality: float = 0.0    # 0 = conversational, 1 = keyword/technical
     is_question: bool = False
+    # Exclusions lifted out of the query before retrieval. Embeddings cannot
+    # represent "not X" (measured: a query and its negation sit at cosine
+    # 0.89), so "not X" is removed from the text and applied as a filter.
+    constraints: object | None = None
 
 
 def normalize(text: str) -> str:
@@ -91,23 +95,42 @@ def _technicality(original: str, keywords: list[str]) -> float:
 
 
 def process_query(query: str, expand: bool = True) -> ProcessedQuery:
+    from backend.app.services.constraints import parse_constraints
+
     norm = normalize(query)
-    kws = _keywords(norm)
+    # Strip exclusions FIRST. Everything downstream -- keywords, expansion,
+    # the dense vector -- must see only what the user actually wants, or the
+    # excluded topic leaks back in through one of them.
+    cons = parse_constraints(norm)
+    retrieval_text = cons.positive_text
+
+    kws = _keywords(retrieval_text)
     expansions: list[str] = []
     if expand:
-        low = " " + norm.lower() + " "
+        low = " " + retrieval_text.lower() + " "
+        negated = " ".join(cons.negated_spans).lower()
         for term, alts in _EXPANSIONS.items():
             if f" {term} " in low or term in kws:
+                # Never expand a term the user excluded. This is what turned
+                # "not related to llm or ai" into a sparse query ending
+                # "...llm or ai large language model" -- the expansion map
+                # had no idea the term sat under a negation.
+                if term in negated:
+                    continue
                 expansions.extend(a for a in alts if a.lower() not in low)
-    sparse_query = norm if not expansions else f"{norm} {' '.join(expansions)}"
+    sparse_query = (
+        retrieval_text if not expansions
+        else f"{retrieval_text} {' '.join(expansions)}"
+    )
     return ProcessedQuery(
         original=query,
         normalized=norm,
         sparse_query=sparse_query,
-        dense_query=norm,
+        dense_query=retrieval_text,
         keywords=kws,
         expansions=expansions,
-        technicality=_technicality(norm, kws),
+        constraints=cons,
+        technicality=_technicality(retrieval_text, kws),
         is_question=norm.rstrip().endswith("?")
         or bool(re.match(r"(?i)^(what|why|how|when|which|who|does|do|can|compare|explain)\b", norm)),
     )

@@ -21,6 +21,7 @@ from backend.app.core.config import settings
 from backend.app.db.models import Chunk, Paper, QueryLog
 from backend.app.db.session import db_session, init_db
 from backend.app.services.arxiv_client import PaperMeta, search_arxiv, upsert_papers
+from backend.app.services.constraints import violates
 from backend.app.services.documents.chunker import chunk_document
 from backend.app.services.documents.loader import load_document
 from backend.app.services.embeddings import get_embedder
@@ -205,6 +206,9 @@ class SearchPipeline:
         return {
             "notice": notice,
             "query": pq.normalized,
+            "constraints": (
+                pq.constraints.describe() if getattr(pq, "constraints", None) else ""
+            ),
             "expansions": pq.expansions,
             "alpha_hint": round(1 - pq.technicality, 3),
             "latency_ms": round(latency, 1),
@@ -243,18 +247,32 @@ class SearchPipeline:
             rows = s.execute(select(Paper).where(Paper.arxiv_id.in_(ids))).scalars().all()
         by_id = {p.arxiv_id: p for p in rows}
         candidates = []
+        excluded = 0
+        cons = getattr(pq, "constraints", None)
         for pid in ids:
             p = by_id.get(pid)
             if not p:
                 continue
+            d = p.to_dict()
+            # Apply the hard exclusions the user stated. This runs here and
+            # not inside the retrievers because the embedding cannot encode
+            # "not X" at all -- a negated query and its positive form sit at
+            # cosine ~0.89 -- so the only place the constraint can be honoured
+            # is after candidates come back, as a filter.
+            if cons is not None and cons.has_exclusions:
+                if violates(d, cons):
+                    excluded += 1
+                    continue
             candidates.append(
-                {
-                    **p.to_dict(),
-                    "text": f"{p.title}. {p.abstract}",
-                    "fused_score": scores[pid],
-                }
+                {**d, "text": f"{p.title}. {p.abstract}", "fused_score": scores[pid]}
             )
-        return self.reranker.rerank(pq.normalized, candidates, top_k=top_k)
+        if excluded:
+            logger.info("constraints removed %d candidates (%s)",
+                        excluded, cons.describe())
+        # Rerank against the POSITIVE text. Handing the reranker the raw
+        # query would feed the excluded topic straight back into scoring.
+        rerank_query = cons.positive_text if cons is not None else pq.normalized
+        return self.reranker.rerank(rerank_query, candidates, top_k=top_k)
 
     # ---------------------------------------------------------- lazy load
     def ensure_paper_indexed(self, arxiv_id: str) -> int:

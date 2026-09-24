@@ -116,6 +116,10 @@ with tab_search:
                          f"retrieval+rerank {t['retrieve_rerank']:.0f})")
             if data["expansions"]:
                 meta += " · expanded with: " + ", ".join(data["expansions"])
+            if data.get("constraints"):
+                # Say what was filtered out and why. A result list silently
+                # shortened by a rule the user cannot see is not trustworthy.
+                meta += " · " + data["constraints"]
             st.caption(meta)
 
     for r in st.session_state.results:

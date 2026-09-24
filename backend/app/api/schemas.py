@@ -27,6 +27,10 @@ class SearchResponse(BaseModel):
     query: str
     timings_ms: dict[str, float] | None = None
     notice: str | None = None
+    # Exclusions parsed out of the query and applied as a hard filter.
+    # Surfaced deliberately: a search that silently drops results the user
+    # cannot see the reason for is worse than one that returns them.
+    constraints: str | None = None
     expansions: list[str]
     alpha_hint: float
     latency_ms: float
