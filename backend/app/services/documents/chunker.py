@@ -33,6 +33,42 @@ _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z(])")
 # arXiv PDF artifacts worth stripping from chunk text
 _NOISE = re.compile(r"arXiv:\d{4}\.\d{4,5}(v\d+)?|^\d+$")
 
+# Front matter: the author / affiliation / funding block on page 1. It is
+# prose, it sits above any detected heading, and it is topically similar to
+# the paper, so it retrieves well and answers nothing. A multi-paper answer
+# came back quoting
+#   "(Corresponding author: Yang Lu.) Yuhang Li and Yang Lu are with the
+#    State Key Laboratory ... (e-mail: 24110137@bjtu.edu.cn)"
+# as its cited evidence.
+_FRONT_MATTER = re.compile(
+    r"e-?mail:|@[\w.-]+\.(?:edu|ac\.\w+|com|org)"
+    r"|corresponding\s+author"
+    r"|(?:is|are)\s+with\s+the\s+(?:School|Department|Institute|Laborator|"
+    r"Faculty|College|Centre|Center|Division)"
+    r"|this\s+work\s+was\s+(?:supported|funded)\s+(?:in\s+part\s+)?by"
+    r"|(?:equal\s+contribution|these\s+authors\s+contributed)",
+    re.I,
+)
+
+# A reference run that survived heading detection: dense in citation
+# markers, sparse in sentences.
+_BIB_MARKER = re.compile(
+    r"(?:vol\.|pp\.|no\.|doi:|arXiv preprint|In Proc\.|Proc\.|Conf\.|"
+    r"IEEE Trans\.|Lecture Notes|ed\.,|eds\.,)", re.I
+)
+
+
+def _is_junk_chunk(text: str) -> bool:
+    """Reject front matter and stray bibliography before it reaches the index.
+
+    chunk_document already skips sections labelled `references`, but that
+    only works where heading detection labelled them. For PDFs where it does
+    not, reference runs arrive as `body`; this is the second line of defence.
+    """
+    if _FRONT_MATTER.search(text):
+        return True
+    return len(_BIB_MARKER.findall(text)) >= 3
+
 
 @dataclass
 class DocChunk:
@@ -86,8 +122,9 @@ def chunk_document(
             fresh += 1
             if length >= chunk_size:
                 chunk_text = " ".join(window)
-                chunks.append(DocChunk(idx, section, heading, chunk_text))
-                idx += 1
+                if not _is_junk_chunk(chunk_text):
+                    chunks.append(DocChunk(idx, section, heading, chunk_text))
+                    idx += 1
                 # sentence-level overlap: keep tail sentences ~overlap chars
                 tail: list[str] = []
                 acc = 0
@@ -101,8 +138,9 @@ def chunk_document(
         if residual and fresh and (
             len(residual) >= settings.min_chunk_chars or not chunks
         ):
-            chunks.append(DocChunk(idx, section, heading, residual))
-            idx += 1
+            if not _is_junk_chunk(residual):
+                chunks.append(DocChunk(idx, section, heading, residual))
+                idx += 1
         elif residual and fresh and chunks and chunks[-1].section == section:
             # merge small residuals into the previous chunk of the section
             chunks[-1].text += " " + residual
