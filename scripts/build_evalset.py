@@ -64,6 +64,16 @@ S2_REFS = "https://api.semanticscholar.org/graph/v1/paper/arXiv:{}/references"
 # bracket number, which measures nothing.
 _BRACKET_CITE = re.compile(r"\[\s*\d+(?:\s*[,;-]\s*\d+)*\s*\]")
 _PAREN_CITE = re.compile(r"\(\s*[A-Z][A-Za-z\-']+(?:\s+et\s+al\.?)?(?:\s*(?:and|&)\s*[A-Z][A-Za-z\-']+)?\s*,?\s*(?:19|20)\d{2}[a-z]?\s*\)")
+# Semicolon-separated citation piles: "(Chapelle et al., 2006; Lee et al.,
+# 2013; Sajjadi et al., 2016; Laine & Aila, 2017)". _PAREN_CITE requires the
+# paren to close right after the year, so it matches none of these and
+# _count_citations scored the whole pile as one citation -- which is how
+#   "A great number of early works (Chapelle et al., 2006; Lee et al., 2013;
+#    Sajjadi et al., 2016; ...)"
+# survived the multi_cite filter and became a "query" describing nothing.
+_PAREN_PILE = re.compile(
+    r"\(\s*[^)]*?(?:19|20)\d{2}[a-z]?\s*(?:;\s*[^)]*?(?:19|20)\d{2}[a-z]?\s*)+\)"
+)
 _NARRATIVE_CITE = re.compile(r"\b[A-Z][A-Za-z\-']+\s+et\s+al\.?\s*\(\s*(?:19|20)\d{2}[a-z]?\s*\)")
 _YEAR_PAREN = re.compile(r"\(\s*(?:19|20)\d{2}[a-z]?\s*\)")
 
@@ -155,6 +165,7 @@ def _select_citing_sentence(raw: str) -> str:
 
 
 def _clean(text: str) -> str:
+    text = _PAREN_PILE.sub(" ", text)
     text = _NARRATIVE_CITE.sub(" ", text)
     text = _PAREN_CITE.sub(" ", text)
     text = _BRACKET_CITE.sub(" ", text)
@@ -171,25 +182,55 @@ def _count_citations(raw: str) -> int:
     # "[1, 2, 3]" is one bracket but three citations
     for m in _BRACKET_CITE.findall(raw):
         n += m.count(",")
+    # "(A et al., 2006; B et al., 2013; C et al., 2016)" is one paren but
+    # three citations -- semicolons count the works inside the pile.
+    for m in _PAREN_PILE.findall(raw):
+        n += m.count(";") + 1
     return max(n, 1)
 
 
-def _mask_title_tokens(query: str, title: str) -> str:
-    """Remove distinctive words lifted straight from the cited title.
+# Mask a run of at least this many consecutive title words.
+_MIN_TITLE_PHRASE = 3
 
-    "we build on the Segment Anything Model" -> the query would be solvable
-    by exact string match, which measures BM25's string matching, not
-    whether the system understood the request. Only rare-ish title words are
-    masked; common ones ("learning", "model") carry real meaning.
+
+def _mask_title_tokens(query: str, title: str) -> str:
+    """Remove verbatim TITLE PHRASES, not individual title words.
+
+    The first version masked any query word longer than four characters that
+    also appeared in the title. That gutted exactly the queries it should
+    have kept:
+
+        gold  "Circadian Patterns of Wikipedia Editorial Activity"
+        query "the broad studies on social aspects of and its communities
+               of users makes it possible to..."
+
+    "Wikipedia" was deleted as a title word, and with it the only token that
+    made the paper findable. Same for TensorFlow and Hemingway. The result
+    is a query that is both unanswerable and unlike anything a human types.
+
+    The artifact actually worth removing is someone quoting the title, which
+    would let BM25 win by string match without understanding anything. A
+    searcher naturally using the topic word is not an artifact -- it is the
+    normal case. So mask only runs of >= _MIN_TITLE_PHRASE consecutive title
+    words, which catches quotation and leaves description alone.
     """
-    title_words = {w.lower().strip(".,:;()") for w in title.split()}
-    title_words -= _STOP
-    kept = []
-    for w in query.split():
-        bare = w.lower().strip(".,:;()\"'")
-        if len(bare) > 4 and bare in title_words:
-            continue
-        kept.append(w)
+    t_words = [w.lower().strip(".,:;()") for w in title.split()]
+    t_words = [w for w in t_words if w]
+    q_tokens = query.split()
+    q_bare = [w.lower().strip(".,:;()\"'") for w in q_tokens]
+
+    title_ngrams = set()
+    for n in range(_MIN_TITLE_PHRASE, min(len(t_words), 8) + 1):
+        for i in range(len(t_words) - n + 1):
+            title_ngrams.add(tuple(t_words[i:i + n]))
+
+    drop = [False] * len(q_tokens)
+    for n in range(min(8, len(q_bare)), _MIN_TITLE_PHRASE - 1, -1):
+        for i in range(len(q_bare) - n + 1):
+            if tuple(q_bare[i:i + n]) in title_ngrams:
+                for j in range(i, i + n):
+                    drop[j] = True
+    kept = [w for w, d in zip(q_tokens, drop) if not d]
     return _WS.sub(" ", " ".join(kept)).strip()
 
 
@@ -223,7 +264,35 @@ def _is_usable_context(raw: str, cleaned: str, title: str) -> tuple[bool, str]:
     return True, ""
 
 
-def fetch_references(client: httpx.Client, arxiv_id: str, limit: int = 100) -> list[dict]:
+# Raw S2 responses are cached to disk, one file per citing paper.
+#
+# The first full build took 700 minutes, almost all of it waiting on the
+# API at ~2s per citing paper. Without a cache, every change to the quality
+# filter -- and the filter needed four rounds of changes -- means paying
+# that 11 hours again to re-download bytes we already had. With it, a
+# filter change re-applies offline in seconds and the API is hit once.
+S2_CACHE = Path("evaluation/data/s2_cache")
+
+
+def fetch_references(
+    client: httpx.Client, arxiv_id: str, limit: int = 100,
+    use_cache: bool = True,
+) -> list[dict]:
+    cache_file = S2_CACHE / f"{arxiv_id.replace('/', '_')}.json"
+    if use_cache and cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass          # corrupt cache entry: re-fetch below
+
+    data = _fetch_references_uncached(client, arxiv_id, limit)
+    if use_cache:
+        S2_CACHE.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def _fetch_references_uncached(client: httpx.Client, arxiv_id: str, limit: int) -> list[dict]:
     for attempt in range(5):
         try:
             r = client.get(
@@ -273,8 +342,10 @@ def build(
         for i, citing_id in enumerate(candidates):
             if len(rows) >= n_citing * 3 or i >= n_citing:
                 break
+            cached = (S2_CACHE / f"{citing_id.replace('/', '_')}.json").exists()
             refs = fetch_references(client, citing_id)
-            time.sleep(sleep_s)
+            if not cached:
+                time.sleep(sleep_s)   # rate-limit only real API calls
             if not refs:
                 continue
             n_api_hits += 1
@@ -313,7 +384,10 @@ def build(
                     break                       # one query per (citing, cited) pair
 
             if (i + 1) % 25 == 0:
-                print(f"  {i+1:>4} citing papers scanned -> {len(rows)} queries")
+                # flush: piped stdout is block-buffered, so without this an
+                # 11-hour run shows no progress at all until it finishes.
+                print(f"  {i+1:>4} citing papers scanned -> {len(rows)} queries",
+                      flush=True)
 
     # One query per gold paper keeps the metric from being dominated by a
     # handful of heavily-cited works.

@@ -25,7 +25,7 @@ def _load_cross_encoder():
     try:
         from sentence_transformers import CrossEncoder
 
-        m = CrossEncoder(settings.reranker_model, max_length=512)
+        m = CrossEncoder(settings.reranker_model, max_length=settings.rerank_max_length)
         logger.info("Loaded cross-encoder %s", settings.reranker_model)
         return m
     except Exception as exc:
@@ -77,7 +77,10 @@ class Reranker:
 
         model = _load_cross_encoder()
         if model is not None:
-            pairs = [(query, c.get(text_key, "")[:2000]) for c in candidates]
+            # Truncating here as well as at the tokenizer avoids shipping
+            # 2000 characters into a 256-token window and paying to tokenize
+            # text that is discarded anyway.
+            pairs = [(query, c.get(text_key, "")[:1200]) for c in candidates]
             raw = model.predict(pairs, show_progress_bar=False)
             for c, s in zip(candidates, raw):
                 c["rerank_score"] = _sigmoid(float(s))

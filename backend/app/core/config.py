@@ -91,9 +91,34 @@ class Settings(BaseSettings):
     reranker_enabled: bool = True
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_top_k: int = 10               # papers surviving the reranker
+    # The cross-encoder reads (query, title+abstract) pairs. Cost is roughly
+    # linear in this window, so shortening it is tempting -- but measured on
+    # 60 citation-derived queries over the 55k snapshot it is a real trade,
+    # not a free win:
+    #
+    #   512 tokens  MRR 0.1564  R@5 0.1833  2463ms / 30 candidates
+    #   256 tokens  MRR 0.1472  R@5 0.1667  1352ms / 30 candidates
+    #
+    # 1.8x faster for -6% MRR and -9% R@5. Default stays at 512: an accuracy
+    # cut should be chosen deliberately, not inherited from a speed tweak.
+    # Drop to 256 only if latency is the binding constraint and you are
+    # willing to state the cost.
+    rerank_max_length: int = 512
     # Corrective retrieval: if the best reranked score is below this
     # confidence, expand the query and retry once (Corrective-RAG style).
-    corrective_retrieval: bool = True
+    #
+    # DISABLED BY DEFAULT because the threshold was never calibrated against
+    # the score distribution it is compared to. ms-marco-MiniLM emits logits
+    # that sigmoid to near zero on scientific abstracts: measured over 15
+    # real queries the top score had median 0.0003 and max 0.0257, against a
+    # threshold of 0.15. The gate therefore failed on 15/15 queries and
+    # every search paid a second full retrieve+rerank -- a 2x latency tax
+    # that fired unconditionally rather than on low confidence.
+    #
+    # Re-enabling needs a threshold derived from the measured distribution
+    # (or a relative test -- is the top result clearly better than the rest
+    # -- rather than an absolute one), not another guess.
+    corrective_retrieval: bool = False
     corrective_score_threshold: float = 0.15
 
     # ---------------------------------------------------------- chunking
