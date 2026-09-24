@@ -173,6 +173,7 @@ def parse_constraints(query: str) -> QueryConstraints:
     exclude_terms: list[str] = []
     exclude_cats: list[str] = []
     negated_spans: list[str] = []
+    groups: list[tuple[str, list[str], list[str]]] = []
     positive = query
 
     for m in _NEG_RE.finditer(query):
@@ -189,9 +190,11 @@ def parse_constraints(query: str) -> QueryConstraints:
             term = _clean_term(raw_term)
             if not term or len(term) < 2:
                 continue
-            exclude_terms.append(term)
-            exclude_terms.extend(_EXCLUDE_SYNONYMS.get(term, []))
-            exclude_cats.extend(_EXCLUDE_CATEGORIES.get(term, []))
+            # Remember which negated root each synonym came from, so a
+            # collision with the positive query can retract the whole
+            # inference rather than one surface form of it.
+            groups.append((term, _EXCLUDE_SYNONYMS.get(term, []),
+                           _EXCLUDE_CATEGORIES.get(term, [])))
 
         # Remove the whole negated clause from the text used for retrieval,
         # so the encoder never sees the excluded topic at all. This is the
@@ -202,9 +205,41 @@ def parse_constraints(query: str) -> QueryConstraints:
     positive = re.sub(r"\s+", " ", positive).strip(" ,;.")
     if not positive:                    # the query was nothing but exclusions
         positive = query
+
+    # Never exclude something the user also ASKED FOR.
+    #
+    # "computer networking concepts for running large language models in a
+    # data centre, not related to AI" expands "ai" to a synonym list that
+    # includes "large language model" -- a phrase from the positive half of
+    # the same sentence. Without this guard the filter rejected
+    # "Alibaba HPN: A Data Center Network for Large Language Model Training",
+    # the exact paper being asked for, because it "mentions 'large language
+    # model'". The category rule banned it a second time via cs.LG.
+    #
+    # Retracting only the one colliding synonym is not enough: "llm" would
+    # still ban the same paper. A collision means our EXPANSION of what the
+    # user meant contradicts what they typed, so the whole inference from
+    # that root is dropped -- synonyms and categories both. The literal word
+    # they negated is kept only if it does not itself appear in the request.
+    pos_low = " " + positive.lower() + " "
+
+    def _in_positive(term: str) -> bool:
+        # allow a plural: "large language models" in the request must match
+        # the excluded term "large language model".
+        return bool(re.search(
+            r"(?<![a-z0-9])" + re.escape(term) + r"(?:e?s)?(?![a-z0-9])", pos_low))
+
+    for root, syns, cats in groups:
+        collides = _in_positive(root) or any(_in_positive(x) for x in syns)
+        if collides:
+            continue                    # the user asked for this; do not ban it
+        exclude_terms.append(root)
+        exclude_terms.extend(syns)
+        exclude_cats.extend(cats)
+
     return QueryConstraints(
         positive_text=positive,
-        exclude_terms=list(dict.fromkeys(exclude_terms)),
+        exclude_terms=exclude_terms,
         exclude_categories=list(dict.fromkeys(exclude_cats)),
         negated_spans=negated_spans,
     )
